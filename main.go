@@ -310,6 +310,9 @@ func deleteBenchmarkTable(ctx context.Context, client *dynamodb.Client) error {
 func runWorker(ctx context.Context, client *dynamodb.Client, workerID int, stopChan <-chan struct{}) {
 	log.Printf("Worker %d started", workerID)
 
+	// Create a per-worker random source to avoid global rand mutex contention
+	rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
+
 	for {
 		// Check for shutdown signals first
 		select {
@@ -324,20 +327,20 @@ func runWorker(ctx context.Context, client *dynamodb.Client, workerID int, stopC
 		}
 
 		// Randomly select an operation to perform
-		operation := rand.Intn(6)
+		operation := rng.Intn(6)
 		switch operation {
 		case 0:
-			performPutItem(ctx, client, workerID)
+			performPutItem(ctx, client, workerID, rng)
 		case 1:
-			performGetItem(ctx, client, workerID)
+			performGetItem(ctx, client, workerID, rng)
 		case 2:
-			performUpdateItem(ctx, client, workerID)
+			performUpdateItem(ctx, client, workerID, rng)
 		case 3:
-			performBatchWriteItem(ctx, client, workerID)
+			performBatchWriteItem(ctx, client, workerID, rng)
 		case 4:
-			performBatchGetItem(ctx, client, workerID)
+			performBatchGetItem(ctx, client, workerID, rng)
 		case 5:
-			performListTables(ctx, client, workerID)
+			performListTables(ctx, client, workerID, rng)
 		}
 
 		// Check again after operation completes
@@ -354,7 +357,7 @@ func runWorker(ctx context.Context, client *dynamodb.Client, workerID int, stopC
 	}
 }
 
-func withRetry(ctx context.Context, operationName string, operation func() error) error {
+func withRetry(ctx context.Context, operationName string, rng *rand.Rand, operation func() error) error {
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		// Check if context is cancelled before attempting
@@ -383,9 +386,9 @@ func withRetry(ctx context.Context, operationName string, operation func() error
 			break
 		}
 
-		// Calculate exponential backoff
+		// Calculate exponential backoff with jitter
 		backoffMs := initialBackoffMs * (1 << attempt) // 1s, 2s, 4s, 8s, 16s
-		jitter := rand.Intn(backoffMs / 4)             // Add some jitter
+		jitter := rng.Intn(backoffMs / 4)              // Add some jitter
 		sleepDuration := time.Duration(backoffMs+jitter) * time.Millisecond
 
 		log.Printf("[%s] Attempt %d failed: %v. Retrying in %v...", operationName, attempt+1, err, sleepDuration)
@@ -401,11 +404,11 @@ func withRetry(ctx context.Context, operationName string, operation func() error
 	return fmt.Errorf("all %d retries failed for %s: %w", maxRetries, operationName, lastErr)
 }
 
-func performPutItem(ctx context.Context, client *dynamodb.Client, workerID int) {
+func performPutItem(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
 	pk := fmt.Sprintf("worker_%d", workerID)
-	sk := fmt.Sprintf("item_%d", rand.Intn(1000))
+	sk := fmt.Sprintf("item_%d", rng.Intn(1000))
 
-	err := withRetry(ctx, "PutItem", func() error {
+	err := withRetry(ctx, "PutItem", rng, func() error {
 		_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: aws.String(*tableName),
 			Item: map[string]types.AttributeValue{
@@ -425,11 +428,11 @@ func performPutItem(ctx context.Context, client *dynamodb.Client, workerID int) 
 	}
 }
 
-func performGetItem(ctx context.Context, client *dynamodb.Client, workerID int) {
-	pk := fmt.Sprintf("worker_%d", rand.Intn(*threads))
-	sk := fmt.Sprintf("item_%d", rand.Intn(1000))
+func performGetItem(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
+	pk := fmt.Sprintf("worker_%d", rng.Intn(*threads))
+	sk := fmt.Sprintf("item_%d", rng.Intn(1000))
 
-	err := withRetry(ctx, "GetItem", func() error {
+	err := withRetry(ctx, "GetItem", rng, func() error {
 		_, err := client.GetItem(ctx, &dynamodb.GetItemInput{
 			TableName: aws.String(*tableName),
 			Key: map[string]types.AttributeValue{
@@ -447,11 +450,11 @@ func performGetItem(ctx context.Context, client *dynamodb.Client, workerID int) 
 	}
 }
 
-func performUpdateItem(ctx context.Context, client *dynamodb.Client, workerID int) {
+func performUpdateItem(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
 	pk := fmt.Sprintf("worker_%d", workerID)
-	sk := fmt.Sprintf("item_%d", rand.Intn(1000))
+	sk := fmt.Sprintf("item_%d", rng.Intn(1000))
 
-	err := withRetry(ctx, "UpdateItem", func() error {
+	err := withRetry(ctx, "UpdateItem", rng, func() error {
 		_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName: aws.String(*tableName),
 			Key: map[string]types.AttributeValue{
@@ -478,9 +481,9 @@ func performUpdateItem(ctx context.Context, client *dynamodb.Client, workerID in
 	}
 }
 
-func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerID int) {
+func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
 	// Batch size between 5 and 25 items
-	batchSize := 5 + rand.Intn(21)
+	batchSize := 5 + rng.Intn(21)
 	pk := fmt.Sprintf("batch_worker_%d", workerID)
 
 	// Use a map to ensure unique sort keys
@@ -507,7 +510,7 @@ func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerI
 		})
 	}
 
-	err := withRetry(ctx, "BatchWriteItem", func() error {
+	err := withRetry(ctx, "BatchWriteItem", rng, func() error {
 		_, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
 			RequestItems: map[string][]types.WriteRequest{
 				*tableName: writeRequests,
@@ -523,17 +526,17 @@ func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerI
 	}
 }
 
-func performBatchGetItem(ctx context.Context, client *dynamodb.Client, workerID int) {
+func performBatchGetItem(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
 	// Batch size between 5 and 100 items
-	batchSize := 5 + rand.Intn(96)
+	batchSize := 5 + rng.Intn(96)
 
 	// Use a map to ensure unique key combinations
 	usedKeys := make(map[string]bool)
 	keys := make([]map[string]types.AttributeValue, 0, batchSize)
 
 	for len(keys) < batchSize {
-		pk := fmt.Sprintf("worker_%d", rand.Intn(*threads))
-		sk := fmt.Sprintf("item_%d", rand.Intn(1000))
+		pk := fmt.Sprintf("worker_%d", rng.Intn(*threads))
+		sk := fmt.Sprintf("item_%d", rng.Intn(1000))
 		keyStr := pk + "|" + sk
 
 		if usedKeys[keyStr] {
@@ -547,7 +550,7 @@ func performBatchGetItem(ctx context.Context, client *dynamodb.Client, workerID 
 		})
 	}
 
-	err := withRetry(ctx, "BatchGetItem", func() error {
+	err := withRetry(ctx, "BatchGetItem", rng, func() error {
 		_, err := client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
 			RequestItems: map[string]types.KeysAndAttributes{
 				*tableName: {
@@ -565,8 +568,8 @@ func performBatchGetItem(ctx context.Context, client *dynamodb.Client, workerID 
 	}
 }
 
-func performListTables(ctx context.Context, client *dynamodb.Client, workerID int) {
-	err := withRetry(ctx, "ListTables", func() error {
+func performListTables(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
+	err := withRetry(ctx, "ListTables", rng, func() error {
 		_, err := client.ListTables(ctx, &dynamodb.ListTablesInput{
 			Limit: aws.Int32(10),
 		})
