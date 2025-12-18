@@ -5,13 +5,13 @@ go 1.24.0
 require (
 	github.com/aws/aws-sdk-go-v2 v1.40.1
 	github.com/aws/aws-sdk-go-v2/config v1.27.27
+	github.com/aws/aws-sdk-go-v2/credentials v1.19.3
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.53.3
 	github.com/scylladb/alternator-client-golang/sdkv2 v1.0.5
 	github.com/scylladb/alternator-load-balancing/go/v2 v2.0.0-20250225102437-2af78f7cf999
 )
 
 require (
-	github.com/aws/aws-sdk-go-v2/credentials v1.19.3 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.18.15 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.15 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.15 // indirect

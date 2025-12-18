@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,12 +21,66 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	// Import the alternator-client-golang sdkv2 subpackage
 	helper "github.com/scylladb/alternator-client-golang/sdkv2"
 )
+
+// originalStderr holds the real stderr before we redirect it
+var originalStderr *os.File
+
+// filteringWriter filters out SDK warning messages
+type filteringWriter struct {
+	writer io.Writer
+}
+
+func (fw *filteringWriter) Write(p []byte) (n int, err error) {
+	s := string(p)
+	// Filter out SDK warnings
+	if strings.Contains(s, "failed to close HTTP response body") {
+		return len(p), nil
+	}
+	if strings.Contains(s, "SDK") && strings.Contains(s, "WARN") {
+		return len(p), nil
+	}
+	return fw.writer.Write(p)
+}
+
+func init() {
+	// Save original stderr
+	originalStderr = os.Stderr
+
+	// Create a pipe
+	r, w, err := os.Pipe()
+	if err != nil {
+		return // Fall back to normal stderr
+	}
+
+	// Replace stderr with the write end of the pipe
+	os.Stderr = w
+
+	// Also redirect the log package to our filtered output
+	log.SetOutput(&filteringWriter{writer: originalStderr})
+
+	// Start a goroutine to read from the pipe and filter
+	go func() {
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			line := scanner.Text()
+			// Filter out SDK warnings
+			if strings.Contains(line, "failed to close HTTP response body") {
+				continue
+			}
+			if strings.HasPrefix(line, "SDK") && strings.Contains(line, "WARN") {
+				continue
+			}
+			fmt.Fprintln(originalStderr, line)
+		}
+	}()
+}
 
 // Command-line flags
 var (
@@ -32,6 +91,8 @@ var (
 	scyllaPort          = flag.Int("scylla-port", 8000, "ScyllaDB Alternator port")
 	region              = flag.String("region", "us-east-1", "AWS region for DynamoDB")
 	tableName           = flag.String("table-name", "benchmark_table", "Name of the table to use for benchmarking")
+	maxConns            = flag.Int("max-conns", 0, "Max HTTP connections per host (0 = 2x threads)")
+	directMode          = flag.Bool("direct", false, "Bypass alternator-client-golang library and connect directly to first node (for debugging)")
 )
 
 // Metrics counters
@@ -43,6 +104,10 @@ type Metrics struct {
 	batchWriteItemOps int64
 	listTablesOps     int64
 	errors            int64
+	
+	// Latency tracking (in microseconds)
+	totalLatencyUs    int64
+	opCount           int64
 }
 
 // Global metrics
@@ -161,8 +226,76 @@ func createClient(ctx context.Context) (*dynamodb.Client, error) {
 	}
 }
 
+// createHighConcurrencyHTTPClient creates an HTTP client optimized for high-concurrency workloads
+func createHighConcurrencyHTTPClient() *http.Client {
+	// Determine connection pool size
+	poolSize := *maxConns
+	if poolSize <= 0 {
+		poolSize = *threads * 2 // Default: 2x the number of threads
+	}
+
+	log.Printf("HTTP connection pool: MaxIdleConnsPerHost=%d, MaxConnsPerHost=%d", poolSize, poolSize)
+
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          poolSize * 2, // Total idle connections across all hosts
+		MaxIdleConnsPerHost:   poolSize,     // Idle connections per host
+		MaxConnsPerHost:       poolSize,     // Max connections per host
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   60 * time.Second,
+	}
+}
+
+// createAlternatorHTTPClient creates an HTTP client for Alternator
+func createAlternatorHTTPClient() *http.Client {
+	// Determine connection pool size
+	poolSize := *maxConns
+	if poolSize <= 0 {
+		poolSize = *threads * 2 // Default: 2x the number of threads
+	}
+
+	log.Printf("Alternator HTTP connection pool: MaxIdleConnsPerHost=%d, MaxConnsPerHost=%d", poolSize, poolSize)
+
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     false, // Alternator uses HTTP/1.1
+		MaxIdleConns:          poolSize * 2,
+		MaxIdleConnsPerHost:   poolSize,
+		MaxConnsPerHost:       poolSize,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		// Don't set TLSClientConfig for HTTP connections - it can cause issues
+	}
+
+	return &http.Client{
+		Transport: transport,
+		// Don't set client-level timeout - let the SDK handle timeouts
+	}
+}
+
 func createDynamoDBClient(ctx context.Context) (*dynamodb.Client, error) {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(*region))
+	httpClient := createHighConcurrencyHTTPClient()
+
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(*region),
+		config.WithHTTPClient(httpClient),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
@@ -177,27 +310,60 @@ func createAlternatorClient(ctx context.Context) (*dynamodb.Client, error) {
 		contactPoints[i] = strings.TrimSpace(cp)
 	}
 
+	// Direct mode: bypass alternator-client-golang library entirely
+	// This helps isolate whether the library is the bottleneck
+	if *directMode {
+		endpoint := fmt.Sprintf("http://%s:%d", contactPoints[0], *scyllaPort)
+		log.Printf("DIRECT MODE: Connecting directly to %s (bypassing alternator-client-golang)", endpoint)
+
+		// Create HTTP client with high concurrency settings
+		httpClient := createAlternatorHTTPClient()
+
+		// Use config.LoadDefaultConfig with custom endpoint resolver
+		cfg, err := config.LoadDefaultConfig(ctx,
+			config.WithRegion("us-east-1"), // Alternator ignores this but SDK requires it
+			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+				"alternator",  // Access key
+				"secret_pass", // Secret key
+				"",            // Session token
+			)),
+			config.WithHTTPClient(httpClient),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load config: %w", err)
+		}
+
+		// Create DynamoDB client with custom endpoint
+		client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
+			o.BaseEndpoint = aws.String(endpoint)
+		})
+
+		return client, nil
+	}
+
 	// Use the ScyllaDB alternator-client-golang sdkv2 library v1.0.5
-	// Based on the library's README:
-	// https://github.com/scylladb/alternator-client-golang
-	//
-	// Available options:
-	// - helper.WithPort(port) - Set the Alternator port
-	// - helper.WithCredentials(accessKey, secretKey) - Set credentials
-	// - helper.WithOptimizeHeaders(true) - Optimize HTTP headers (reduces traffic up to 56%)
-	// - helper.WithIgnoreServerCertificateError(true) - Skip TLS cert validation
-	// - helper.WithScheme("http") - Use HTTP or "https" for HTTPS
-	// - helper.WithRack("rack") - Target specific rack
-	// - helper.WithDatacenter("dc") - Target specific datacenter
-	// - helper.WithHTTPClientTimeout(duration) - Set HTTP timeout
-	h, err := helper.NewHelper(
-		contactPoints,
+	log.Printf("Using alternator-client-golang library with %d contact points", len(contactPoints))
+
+	// Build helper options
+	helperOpts := []helper.Option{
 		helper.WithPort(*scyllaPort),
-		helper.WithCredentials("alternator", "secret_pass"), // Ignored when auth is disabled
-		helper.WithOptimizeHeaders(true),                    // Optimize HTTP headers for Alternator
-		helper.WithIgnoreServerCertificateError(true),       // Skip TLS cert validation
-		helper.WithScheme("http"),                           // Use HTTP (change to "https" for TLS)
-	)
+		helper.WithCredentials("alternator", "secret_pass"),
+		helper.WithOptimizeHeaders(true),
+		helper.WithIgnoreServerCertificateError(true),
+		helper.WithScheme("http"),
+	}
+
+	// Only add custom HTTP client if max-conns is explicitly set
+	// (the library may have issues with custom HTTP clients)
+	if *maxConns > 0 {
+		httpClient := createAlternatorHTTPClient()
+		helperOpts = append(helperOpts, helper.WithAWSConfigOptions(func(cfg *aws.Config) {
+			cfg.HTTPClient = httpClient
+		}))
+		log.Printf("Using custom HTTP client with MaxConnsPerHost=%d", *maxConns)
+	}
+
+	h, err := helper.NewHelper(contactPoints, helperOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create alternator helper: %w", err)
 	}
@@ -367,8 +533,14 @@ func withRetry(ctx context.Context, operationName string, rng *rand.Rand, operat
 		default:
 		}
 
+		start := time.Now()
 		err := operation()
+		latencyUs := time.Since(start).Microseconds()
+		
+		// Track latency for successful ops
 		if err == nil {
+			atomic.AddInt64(&metrics.totalLatencyUs, latencyUs)
+			atomic.AddInt64(&metrics.opCount, 1)
 			return nil
 		}
 
@@ -391,7 +563,7 @@ func withRetry(ctx context.Context, operationName string, rng *rand.Rand, operat
 		jitter := rng.Intn(backoffMs / 4)              // Add some jitter
 		sleepDuration := time.Duration(backoffMs+jitter) * time.Millisecond
 
-		log.Printf("[%s] Attempt %d failed: %v. Retrying in %v...", operationName, attempt+1, err, sleepDuration)
+		log.Printf("[%s] Attempt %d failed (latency=%dms): %v. Retrying in %v...", operationName, attempt+1, latencyUs/1000, err, sleepDuration)
 
 		select {
 		case <-ctx.Done():
@@ -402,6 +574,11 @@ func withRetry(ctx context.Context, operationName string, rng *rand.Rand, operat
 	}
 
 	return fmt.Errorf("all %d retries failed for %s: %w", maxRetries, operationName, lastErr)
+}
+
+// isShutdownError returns true if the error is due to context cancellation (Ctrl+C)
+func isShutdownError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func performPutItem(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
@@ -421,9 +598,9 @@ func performPutItem(ctx context.Context, client *dynamodb.Client, workerID int, 
 		return err
 	})
 
-	if err != nil {
+	if err != nil && !isShutdownError(err) {
 		atomic.AddInt64(&metrics.errors, 1)
-	} else {
+	} else if err == nil {
 		atomic.AddInt64(&metrics.putItemOps, 1)
 	}
 }
@@ -443,9 +620,9 @@ func performGetItem(ctx context.Context, client *dynamodb.Client, workerID int, 
 		return err
 	})
 
-	if err != nil {
+	if err != nil && !isShutdownError(err) {
 		atomic.AddInt64(&metrics.errors, 1)
-	} else {
+	} else if err == nil {
 		atomic.AddInt64(&metrics.getItemOps, 1)
 	}
 }
@@ -474,9 +651,9 @@ func performUpdateItem(ctx context.Context, client *dynamodb.Client, workerID in
 		return err
 	})
 
-	if err != nil {
+	if err != nil && !isShutdownError(err) {
 		atomic.AddInt64(&metrics.errors, 1)
-	} else {
+	} else if err == nil {
 		atomic.AddInt64(&metrics.updateItemOps, 1)
 	}
 }
@@ -519,9 +696,9 @@ func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerI
 		return err
 	})
 
-	if err != nil {
+	if err != nil && !isShutdownError(err) {
 		atomic.AddInt64(&metrics.errors, 1)
-	} else {
+	} else if err == nil {
 		atomic.AddInt64(&metrics.batchWriteItemOps, 1)
 	}
 }
@@ -561,9 +738,9 @@ func performBatchGetItem(ctx context.Context, client *dynamodb.Client, workerID 
 		return err
 	})
 
-	if err != nil {
+	if err != nil && !isShutdownError(err) {
 		atomic.AddInt64(&metrics.errors, 1)
-	} else {
+	} else if err == nil {
 		atomic.AddInt64(&metrics.batchGetItemOps, 1)
 	}
 }
@@ -576,9 +753,9 @@ func performListTables(ctx context.Context, client *dynamodb.Client, workerID in
 		return err
 	})
 
-	if err != nil {
+	if err != nil && !isShutdownError(err) {
 		atomic.AddInt64(&metrics.errors, 1)
-	} else {
+	} else if err == nil {
 		atomic.AddInt64(&metrics.listTablesOps, 1)
 	}
 }
@@ -604,9 +781,17 @@ func reportMetrics(stopChan <-chan struct{}) {
 			listOps := atomic.LoadInt64(&metrics.listTablesOps)
 			errs := atomic.LoadInt64(&metrics.errors)
 			totalOps := getOps + putOps + updateOps + batchGetOps + batchWriteOps + listOps
+			
+			// Calculate average latency
+			totalLatencyUs := atomic.LoadInt64(&metrics.totalLatencyUs)
+			opCount := atomic.LoadInt64(&metrics.opCount)
+			avgLatencyMs := float64(0)
+			if opCount > 0 {
+				avgLatencyMs = float64(totalLatencyUs) / float64(opCount) / 1000.0
+			}
 
-			log.Printf("[METRICS] Elapsed: %.0fs | Total Ops: %d (%.1f/s) | GetItem: %d | PutItem: %d | UpdateItem: %d | BatchGet: %d | BatchWrite: %d | ListTables: %d | Errors: %d",
-				elapsed, totalOps, float64(totalOps)/elapsed,
+			log.Printf("[METRICS] Elapsed: %.0fs | Ops: %d (%.1f/s) | AvgLatency: %.0fms | Get: %d | Put: %d | Update: %d | BatchGet: %d | BatchWrite: %d | List: %d | Err: %d",
+				elapsed, totalOps, float64(totalOps)/elapsed, avgLatencyMs,
 				getOps, putOps, updateOps, batchGetOps, batchWriteOps, listOps, errs)
 		}
 	}
