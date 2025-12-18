@@ -7,11 +7,15 @@ A Go-based benchmarking tool for comparing performance between AWS DynamoDB and 
 - Supports both AWS DynamoDB and ScyllaDB Alternator
 - Configurable number of concurrent worker threads
 - Multiple DynamoDB operations: GetItem, PutItem, UpdateItem, BatchGetItem, BatchWriteItem, ListTables
+- **Percentile latency tracking (P50/P95/P99)** per operation type
+- **Configurable warmup period** (metrics discarded during warmup)
+- **Configurable read/write ratio** (`--read-pct`)
+- **Data seeding** before benchmark (`--seed-items`)
+- **Table management** (`--create-table`, `--drop-table`)
 - Variable batch sizes for batch operations
 - Exponential backoff retry logic (5 retries with increasing delays: 1s, 2s, 4s, 8s, 16s)
 - Real-time metrics reporting every 10 seconds
 - Graceful shutdown on SIGINT/SIGTERM
-- Automatic table creation and cleanup
 
 ## ScyllaDB Alternator Client Library
 
@@ -100,10 +104,38 @@ go get github.com/scylladb/alternator-client-golang/sdkv2@v1.0.5
 | `--target` | Target database: `ddb` or `alternator` | `ddb` | No |
 | `--threads` | Number of concurrent worker threads | `16` | No |
 | `--duration` | Benchmark duration in seconds | `300` | No |
+| `--warmup` | Warmup period in seconds (metrics discarded) | `10` | No |
 | `--table-name` | Name of the benchmark table | `benchmark_table` | No |
 | `--region` | AWS region (DynamoDB only) | `us-east-1` | No |
 | `--scylla-contact-points` | Comma-separated ScyllaDB nodes | - | Yes (for alternator) |
 | `--scylla-port` | ScyllaDB Alternator port | `8000` | No |
+| `--max-conns` | Max HTTP connections per host (0 = 2x threads) | `0` | No |
+| `--direct` | Bypass alternator-client-golang library | `false` | No |
+
+#### Table Management
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--create-table` | Create the table if it does not exist | `true` |
+| `--drop-table` | Drop the table after the benchmarks | `false` |
+| `--perform-benchmark` | Perform the benchmark | `true` |
+
+#### Data Seeding
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--seed-items` | Number of items to seed before benchmark (0 = no seeding) | `0` |
+| `--seed-batch-size` | Number of items per BatchWriteItem during seeding (max 25) | `25` |
+
+#### Operation Mix
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--read-pct` | Percentage of read operations (0-100) | `50` |
+
+Reads = GetItem + BatchGetItem  
+Writes = PutItem + UpdateItem + BatchWriteItem  
+ListTables is always ~5% of operations.
 
 ### Running against AWS DynamoDB
 
@@ -129,17 +161,46 @@ go run main.go --target alternator \
     --scylla-contact-points 192.168.1.100 \
     --scylla-port 8000
 
-# Multiple nodes
+# Multiple nodes with full options
 go run main.go --target alternator \
     --scylla-contact-points "192.168.1.100,192.168.1.101,192.168.1.102" \
     --scylla-port 8000 \
     --threads 32 \
-    --duration 600
+    --duration 600 \
+    --warmup 10 \
+    --read-pct 80 \
+    --max-conns 64
+```
 
-# Using hostnames
+### Seeding Data Before Benchmark
+
+```bash
+# Seed 10000 items, then run benchmark
 go run main.go --target alternator \
-    --scylla-contact-points "scylla-node1.example.com,scylla-node2.example.com" \
-    --scylla-port 8000
+    --scylla-contact-points "192.168.1.100" \
+    --seed-items 10000 \
+    --seed-batch-size 25 \
+    --threads 32 \
+    --duration 60
+
+# Seed data only (no benchmark)
+go run main.go --target alternator \
+    --scylla-contact-points "192.168.1.100" \
+    --seed-items 10000 \
+    --perform-benchmark=false \
+    --drop-table=false
+```
+
+### Reusing an Existing Table
+
+```bash
+# Skip table creation, run benchmark, keep table after
+go run main.go --target alternator \
+    --scylla-contact-points "192.168.1.100" \
+    --create-table=false \
+    --drop-table=false \
+    --threads 32 \
+    --duration 60
 ```
 
 ### Building a Binary
@@ -160,32 +221,49 @@ GOOS=linux GOARCH=amd64 go build -o ddb-benchmark-linux main.go
 The tool provides:
 
 1. **Real-time metrics** every 10 seconds showing operation counts and throughput
-2. **Final summary** at the end of the benchmark
+2. **Final summary** with per-operation latency percentiles (P50/P95/P99)
 
 Example output:
 ```
-2024/01/15 10:00:00 Starting benchmark against alternator with 16 threads for 300 seconds
+2024/01/15 10:00:00 Starting benchmark against alternator with 32 threads for 60 seconds (warmup: 10s)
 2024/01/15 10:00:00 Table name: benchmark_table
-2024/01/15 10:00:10 [METRICS] Elapsed: 10s | Total Ops: 1523 (152.3/s) | GetItem: 245 | PutItem: 267 | UpdateItem: 251 | BatchGet: 253 | BatchWrite: 248 | ListTables: 259 | Errors: 0
+2024/01/15 10:00:00 Read percentage: 80% (reads=GetItem+BatchGetItem, writes=PutItem+UpdateItem+BatchWriteItem)
+2024/01/15 10:00:00 Warmup period: 10 seconds...
+2024/01/15 10:00:10 Warmup complete, starting measurement
+2024/01/15 10:00:20 [METRICS] Elapsed: 10s | Ops: 5142 (514.2/s) | Get: 851 | Put: 861 | Update: 843 | BatchGet: 819 | BatchWrite: 937 | List: 831 | Err: 0
 
 ========== FINAL BENCHMARK RESULTS ==========
 Target:              alternator
-Threads:             16
-Duration (seconds):  300
+Threads:             32
+Duration (seconds):  60
+Warmup (seconds):    10
+Read Percentage:     80%
 Table Name:          benchmark_table
 ----------------------------------------------
-Total Operations:    45690
-Operations/Second:   152.30
+
+GetItem:
+  Count:    5100
+  Errors:   0
+  Avg (ms): 62.34
+  P50 (ms): 61.00
+  P95 (ms): 85.00
+  P99 (ms): 102.00
+
+PutItem:
+  Count:    1275
+  Errors:   0
+  Avg (ms): 63.12
+  P50 (ms): 62.00
+  P95 (ms): 86.00
+  P99 (ms): 105.00
+
+... (other operations)
+
 ----------------------------------------------
-GetItem:             7450
-PutItem:             7612
-UpdateItem:          7589
-BatchGetItem:        7520
-BatchWriteItem:      7498
-ListTables:          8021
-----------------------------------------------
-Total Errors:        12
-Error Rate:          0.03%
+Total Operations:    30852
+Operations/Second:   514.20
+Total Errors:        0
+Error Rate:          0.00%
 ==============================================
 ```
 

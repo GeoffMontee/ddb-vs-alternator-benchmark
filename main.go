@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,31 +88,147 @@ var (
 	target              = flag.String("target", "ddb", "Target database: 'ddb' for DynamoDB or 'alternator' for ScyllaDB Alternator")
 	threads             = flag.Int("threads", 16, "Number of concurrent worker threads")
 	duration            = flag.Int("duration", 300, "Duration of the benchmark in seconds")
+	warmup              = flag.Int("warmup", 10, "Warmup period in seconds (metrics discarded)")
 	scyllaContactPoints = flag.String("scylla-contact-points", "", "Comma-separated list of ScyllaDB contact points (IP addresses or hostnames)")
 	scyllaPort          = flag.Int("scylla-port", 8000, "ScyllaDB Alternator port")
 	region              = flag.String("region", "us-east-1", "AWS region for DynamoDB")
 	tableName           = flag.String("table-name", "benchmark_table", "Name of the table to use for benchmarking")
 	maxConns            = flag.Int("max-conns", 0, "Max HTTP connections per host (0 = 2x threads)")
 	directMode          = flag.Bool("direct", false, "Bypass alternator-client-golang library and connect directly to first node (for debugging)")
+
+	// Table management flags
+	createTableFlag  = flag.Bool("create-table", true, "Create the table if it does not exist")
+	dropTable        = flag.Bool("drop-table", false, "Drop the table after the benchmarks")
+	performBenchmark = flag.Bool("perform-benchmark", true, "Perform the benchmark")
+
+	// Data seeding flags
+	seedItems     = flag.Int("seed-items", 0, "Number of items to seed before benchmark (0 = no seeding)")
+	seedBatchSize = flag.Int("seed-batch-size", 25, "Number of items per BatchWriteItem during seeding (max 25)")
+
+	// Operation mix flags
+	readPct = flag.Int("read-pct", 50, "Percentage of read operations (0-100). Reads = GetItem + BatchGetItem. Writes = PutItem + UpdateItem + BatchWriteItem. ListTables is separate.")
 )
 
-// Metrics counters
+// Operation types for latency tracking
+const (
+	OpGetItem = iota
+	OpPutItem
+	OpUpdateItem
+	OpBatchGetItem
+	OpBatchWriteItem
+	OpListTables
+	OpCount
+)
+
+var opNames = []string{"GetItem", "PutItem", "UpdateItem", "BatchGetItem", "BatchWriteItem", "ListTables"}
+
+// LatencyTracker tracks latencies for a single operation type
+type LatencyTracker struct {
+	mu        sync.Mutex
+	latencies []int64 // in microseconds
+	count     int64
+	errors    int64
+}
+
+func (lt *LatencyTracker) Record(latencyUs int64) {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+	lt.latencies = append(lt.latencies, latencyUs)
+	lt.count++
+}
+
+func (lt *LatencyTracker) RecordError() {
+	atomic.AddInt64(&lt.errors, 1)
+}
+
+func (lt *LatencyTracker) GetStats() (count, errors int64, p50, p95, p99, avg float64) {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+
+	count = lt.count
+	errors = atomic.LoadInt64(&lt.errors)
+
+	if len(lt.latencies) == 0 {
+		return count, errors, 0, 0, 0, 0
+	}
+
+	// Sort for percentiles
+	sorted := make([]int64, len(lt.latencies))
+	copy(sorted, lt.latencies)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	n := len(sorted)
+	p50 = float64(sorted[n*50/100]) / 1000.0 // Convert to ms
+	p95 = float64(sorted[n*95/100]) / 1000.0
+	p99 = float64(sorted[n*99/100]) / 1000.0
+
+	var sum int64
+	for _, v := range sorted {
+		sum += v
+	}
+	avg = float64(sum) / float64(n) / 1000.0
+
+	return
+}
+
+func (lt *LatencyTracker) Reset() {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+	lt.latencies = lt.latencies[:0]
+	lt.count = 0
+	atomic.StoreInt64(&lt.errors, 0)
+}
+
+// Metrics holds all operation trackers
 type Metrics struct {
-	getItemOps        int64
-	putItemOps        int64
-	updateItemOps     int64
-	batchGetItemOps   int64
-	batchWriteItemOps int64
-	listTablesOps     int64
-	errors            int64
-	
-	// Latency tracking (in microseconds)
-	totalLatencyUs    int64
-	opCount           int64
+	trackers [OpCount]*LatencyTracker
+}
+
+func NewMetrics() *Metrics {
+	m := &Metrics{}
+	for i := 0; i < OpCount; i++ {
+		m.trackers[i] = &LatencyTracker{
+			latencies: make([]int64, 0, 10000),
+		}
+	}
+	return m
+}
+
+func (m *Metrics) Record(op int, latencyUs int64) {
+	m.trackers[op].Record(latencyUs)
+}
+
+func (m *Metrics) RecordError(op int) {
+	m.trackers[op].RecordError()
+}
+
+func (m *Metrics) Reset() {
+	for i := 0; i < OpCount; i++ {
+		m.trackers[i].Reset()
+	}
+}
+
+func (m *Metrics) GetTotalOps() int64 {
+	var total int64
+	for i := 0; i < OpCount; i++ {
+		total += atomic.LoadInt64(&m.trackers[i].count)
+	}
+	return total
+}
+
+func (m *Metrics) GetTotalErrors() int64 {
+	var total int64
+	for i := 0; i < OpCount; i++ {
+		total += atomic.LoadInt64(&m.trackers[i].errors)
+	}
+	return total
 }
 
 // Global metrics
-var metrics = &Metrics{}
+var metrics = NewMetrics()
+
+// Warmup state
+var warmupComplete int32 // 0 = warming up, 1 = complete
 
 // Retry configuration
 const (
@@ -140,13 +257,47 @@ func main() {
 		log.Fatalf("Failed to create client: %v", err)
 	}
 
-	// Create the benchmark table
-	if err := createBenchmarkTable(ctx, client); err != nil {
-		log.Fatalf("Failed to create benchmark table: %v", err)
+	// Create the benchmark table if requested
+	if *createTableFlag {
+		if err := createBenchmarkTable(ctx, client); err != nil {
+			log.Fatalf("Failed to create benchmark table: %v", err)
+		}
+	} else {
+		log.Printf("Skipping table creation (--create-table=false)")
 	}
 
-	log.Printf("Starting benchmark against %s with %d threads for %d seconds", *target, *threads, *duration)
+	// Seed data if requested
+	if *seedItems > 0 {
+		if err := seedData(ctx, client); err != nil {
+			log.Fatalf("Failed to seed data: %v", err)
+		}
+	}
+
+	// Run benchmark if requested
+	if *performBenchmark {
+		runBenchmark(ctx, client, sigChan, cancel)
+	} else {
+		log.Printf("Skipping benchmark (--perform-benchmark=false)")
+	}
+
+	// Cleanup - delete the table if requested
+	if *dropTable {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cleanupCancel()
+		if err := deleteBenchmarkTable(cleanupCtx, client); err != nil {
+			log.Printf("Warning: Failed to delete benchmark table: %v", err)
+		}
+	} else {
+		log.Printf("Table %s retained (use --drop-table=true to delete)", *tableName)
+	}
+
+	log.Println("Completed successfully")
+}
+
+func runBenchmark(ctx context.Context, client *dynamodb.Client, sigChan chan os.Signal, cancel context.CancelFunc) {
+	log.Printf("Starting benchmark against %s with %d threads for %d seconds (warmup: %ds)", *target, *threads, *duration, *warmup)
 	log.Printf("Table name: %s", *tableName)
+	log.Printf("Read percentage: %d%% (reads=GetItem+BatchGetItem, writes=PutItem+UpdateItem+BatchWriteItem)", *readPct)
 
 	// Start workers
 	var wg sync.WaitGroup
@@ -163,13 +314,32 @@ func main() {
 	// Start metrics reporter
 	go reportMetrics(stopChan)
 
+	// Handle warmup period
+	if *warmup > 0 {
+		log.Printf("Warmup period: %d seconds...", *warmup)
+		select {
+		case <-time.After(time.Duration(*warmup) * time.Second):
+			metrics.Reset()
+			atomic.StoreInt32(&warmupComplete, 1)
+			log.Printf("Warmup complete, starting measurement")
+		case sig := <-sigChan:
+			log.Printf("Received signal %v during warmup, shutting down...", sig)
+			cancel()
+			close(stopChan)
+			wg.Wait()
+			return
+		}
+	} else {
+		atomic.StoreInt32(&warmupComplete, 1)
+	}
+
 	// Wait for duration or signal
 	select {
 	case <-time.After(time.Duration(*duration) * time.Second):
 		log.Println("Benchmark duration completed")
 	case sig := <-sigChan:
 		log.Printf("Received signal %v, shutting down immediately...", sig)
-		cancel() // Cancel context to stop all operations immediately
+		cancel()
 	}
 
 	// Signal workers to stop
@@ -180,15 +350,74 @@ func main() {
 
 	// Print final metrics
 	printFinalMetrics()
+}
 
-	// Cleanup - delete the table (use background context since main context may be cancelled)
-	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cleanupCancel()
-	if err := deleteBenchmarkTable(cleanupCtx, client); err != nil {
-		log.Printf("Warning: Failed to delete benchmark table: %v", err)
+func seedData(ctx context.Context, client *dynamodb.Client) error {
+	log.Printf("Seeding %d items with batch size %d...", *seedItems, *seedBatchSize)
+
+	batchSize := *seedBatchSize
+	if batchSize > 25 {
+		batchSize = 25 // DynamoDB limit
 	}
 
-	log.Println("Benchmark completed successfully")
+	totalBatches := (*seedItems + batchSize - 1) / batchSize
+	itemsWritten := 0
+
+	startTime := time.Now()
+
+	for batch := 0; batch < totalBatches; batch++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		itemsInBatch := batchSize
+		remaining := *seedItems - itemsWritten
+		if remaining < itemsInBatch {
+			itemsInBatch = remaining
+		}
+
+		writeRequests := make([]types.WriteRequest, 0, itemsInBatch)
+		for i := 0; i < itemsInBatch; i++ {
+			itemNum := itemsWritten + i
+			pk := fmt.Sprintf("worker_%d", itemNum%(*threads))
+			sk := fmt.Sprintf("item_%d", itemNum)
+
+			writeRequests = append(writeRequests, types.WriteRequest{
+				PutRequest: &types.PutRequest{
+					Item: map[string]types.AttributeValue{
+						"pk":        &types.AttributeValueMemberS{Value: pk},
+						"sk":        &types.AttributeValueMemberS{Value: sk},
+						"data":      &types.AttributeValueMemberS{Value: fmt.Sprintf("seed_data_%d", itemNum)},
+						"timestamp": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", time.Now().UnixNano())},
+					},
+				},
+			})
+		}
+
+		_, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+			RequestItems: map[string][]types.WriteRequest{
+				*tableName: writeRequests,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to seed batch %d: %w", batch, err)
+		}
+
+		itemsWritten += itemsInBatch
+
+		// Progress update every 10%
+		if (batch+1)%((totalBatches/10)+1) == 0 || batch == totalBatches-1 {
+			elapsed := time.Since(startTime).Seconds()
+			rate := float64(itemsWritten) / elapsed
+			log.Printf("Seeding progress: %d/%d items (%.0f items/s)", itemsWritten, *seedItems, rate)
+		}
+	}
+
+	elapsed := time.Since(startTime).Seconds()
+	log.Printf("Seeding complete: %d items in %.1fs (%.0f items/s)", itemsWritten, elapsed, float64(itemsWritten)/elapsed)
+	return nil
 }
 
 func validateFlags() error {
@@ -200,30 +429,27 @@ func validateFlags() error {
 		return fmt.Errorf("scylla-contact-points is required when target is 'alternator'")
 	}
 
-	if *threads <= 0 {
-		return fmt.Errorf("threads must be positive, got %d", *threads)
+	if *threads < 1 {
+		return fmt.Errorf("threads must be at least 1")
 	}
 
-	if *duration <= 0 {
-		return fmt.Errorf("duration must be positive, got %d", *duration)
+	if *duration < 1 {
+		return fmt.Errorf("duration must be at least 1 second")
 	}
 
-	if *tableName == "" {
-		return fmt.Errorf("table-name cannot be empty")
+	if *warmup < 0 {
+		return fmt.Errorf("warmup must be non-negative")
+	}
+
+	if *readPct < 0 || *readPct > 100 {
+		return fmt.Errorf("read-pct must be between 0 and 100")
+	}
+
+	if *seedBatchSize < 1 || *seedBatchSize > 25 {
+		return fmt.Errorf("seed-batch-size must be between 1 and 25")
 	}
 
 	return nil
-}
-
-func createClient(ctx context.Context) (*dynamodb.Client, error) {
-	switch *target {
-	case "ddb":
-		return createDynamoDBClient(ctx)
-	case "alternator":
-		return createAlternatorClient(ctx)
-	default:
-		return nil, fmt.Errorf("unknown target: %s", *target)
-	}
 }
 
 // createHighConcurrencyHTTPClient creates an HTTP client optimized for high-concurrency workloads
@@ -271,7 +497,7 @@ func createAlternatorHTTPClient() *http.Client {
 	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
+			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     false, // Alternator uses HTTP/1.1
@@ -279,13 +505,27 @@ func createAlternatorHTTPClient() *http.Client {
 		MaxIdleConnsPerHost:   poolSize,
 		MaxConnsPerHost:       poolSize,
 		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
-		// Don't set TLSClientConfig for HTTP connections - it can cause issues
+		DisableCompression:    false,
+		WriteBufferSize:       64 * 1024,
+		ReadBufferSize:        64 * 1024,
 	}
 
 	return &http.Client{
 		Transport: transport,
-		// Don't set client-level timeout - let the SDK handle timeouts
+		Timeout:   60 * time.Second,
+	}
+}
+
+func createClient(ctx context.Context) (*dynamodb.Client, error) {
+	switch *target {
+	case "ddb":
+		return createDynamoDBClient(ctx)
+	case "alternator":
+		return createAlternatorClient(ctx)
+	default:
+		return nil, fmt.Errorf("unknown target: %s", *target)
 	}
 }
 
@@ -385,12 +625,8 @@ func createBenchmarkTable(ctx context.Context, client *dynamodb.Client) error {
 		TableName: aws.String(*tableName),
 	})
 	if err == nil {
-		log.Printf("Table %s already exists, deleting it first...", *tableName)
-		if err := deleteBenchmarkTable(ctx, client); err != nil {
-			return err
-		}
-		// Wait a bit for the table to be fully deleted
-		time.Sleep(5 * time.Second)
+		log.Printf("Table %s already exists", *tableName)
+		return nil
 	}
 
 	// Create table with partition key (pk) and sort key (sk)
@@ -416,19 +652,7 @@ func createBenchmarkTable(ctx context.Context, client *dynamodb.Client) error {
 				AttributeType: types.ScalarAttributeTypeS,
 			},
 		},
-	}
-
-	// Set billing mode based on target
-	if *target == "ddb" {
-		// DynamoDB: use on-demand billing
-		createInput.BillingMode = types.BillingModePayPerRequest
-	} else {
-		// ScyllaDB Alternator: use provisioned throughput (supported in Scylla 2025.3.4)
-		createInput.BillingMode = types.BillingModeProvisioned
-		createInput.ProvisionedThroughput = &types.ProvisionedThroughput{
-			ReadCapacityUnits:  aws.Int64(100),
-			WriteCapacityUnits: aws.Int64(100),
-		}
+		BillingMode: types.BillingModePayPerRequest,
 	}
 
 	_, err = client.CreateTable(ctx, createInput)
@@ -441,7 +665,7 @@ func createBenchmarkTable(ctx context.Context, client *dynamodb.Client) error {
 	waiter := dynamodb.NewTableExistsWaiter(client)
 	err = waiter.Wait(ctx, &dynamodb.DescribeTableInput{
 		TableName: aws.String(*tableName),
-	}, 2*time.Minute)
+	}, 5*time.Minute)
 	if err != nil {
 		return fmt.Errorf("failed waiting for table to become active: %w", err)
 	}
@@ -458,15 +682,6 @@ func deleteBenchmarkTable(ctx context.Context, client *dynamodb.Client) error {
 	})
 	if err != nil {
 		return fmt.Errorf("failed to delete table: %w", err)
-	}
-
-	// Wait for table to be deleted
-	waiter := dynamodb.NewTableNotExistsWaiter(client)
-	err = waiter.Wait(ctx, &dynamodb.DescribeTableInput{
-		TableName: aws.String(*tableName),
-	}, 2*time.Minute)
-	if err != nil {
-		return fmt.Errorf("failed waiting for table deletion: %w", err)
 	}
 
 	log.Printf("Table %s deleted", *tableName)
@@ -492,21 +707,33 @@ func runWorker(ctx context.Context, client *dynamodb.Client, workerID int, stopC
 			// Continue with work
 		}
 
-		// Randomly select an operation to perform
-		operation := rng.Intn(6)
-		switch operation {
-		case 0:
-			performPutItem(ctx, client, workerID, rng)
-		case 1:
-			performGetItem(ctx, client, workerID, rng)
-		case 2:
-			performUpdateItem(ctx, client, workerID, rng)
-		case 3:
-			performBatchWriteItem(ctx, client, workerID, rng)
-		case 4:
-			performBatchGetItem(ctx, client, workerID, rng)
-		case 5:
+		// Select operation based on read-pct
+		// Reads: GetItem, BatchGetItem
+		// Writes: PutItem, UpdateItem, BatchWriteItem
+		// ListTables: always 5% chance
+		roll := rng.Intn(100)
+
+		if roll < 5 {
+			// 5% ListTables
 			performListTables(ctx, client, workerID, rng)
+		} else if roll < 5+(*readPct*95/100) {
+			// Read operation (scaled to remaining 95%)
+			if rng.Intn(2) == 0 {
+				performGetItem(ctx, client, workerID, rng)
+			} else {
+				performBatchGetItem(ctx, client, workerID, rng)
+			}
+		} else {
+			// Write operation
+			writeType := rng.Intn(3)
+			switch writeType {
+			case 0:
+				performPutItem(ctx, client, workerID, rng)
+			case 1:
+				performUpdateItem(ctx, client, workerID, rng)
+			case 2:
+				performBatchWriteItem(ctx, client, workerID, rng)
+			}
 		}
 
 		// Check again after operation completes
@@ -533,14 +760,8 @@ func withRetry(ctx context.Context, operationName string, rng *rand.Rand, operat
 		default:
 		}
 
-		start := time.Now()
 		err := operation()
-		latencyUs := time.Since(start).Microseconds()
-		
-		// Track latency for successful ops
 		if err == nil {
-			atomic.AddInt64(&metrics.totalLatencyUs, latencyUs)
-			atomic.AddInt64(&metrics.opCount, 1)
 			return nil
 		}
 
@@ -563,7 +784,7 @@ func withRetry(ctx context.Context, operationName string, rng *rand.Rand, operat
 		jitter := rng.Intn(backoffMs / 4)              // Add some jitter
 		sleepDuration := time.Duration(backoffMs+jitter) * time.Millisecond
 
-		log.Printf("[%s] Attempt %d failed (latency=%dms): %v. Retrying in %v...", operationName, attempt+1, latencyUs/1000, err, sleepDuration)
+		log.Printf("[%s] Attempt %d failed: %v. Retrying in %v...", operationName, attempt+1, lastErr, sleepDuration)
 
 		select {
 		case <-ctx.Done():
@@ -584,24 +805,27 @@ func isShutdownError(err error) bool {
 func performPutItem(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
 	pk := fmt.Sprintf("worker_%d", workerID)
 	sk := fmt.Sprintf("item_%d", rng.Intn(1000))
+	data := fmt.Sprintf("data_%d_%d", workerID, time.Now().UnixNano())
 
+	start := time.Now()
 	err := withRetry(ctx, "PutItem", rng, func() error {
 		_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: aws.String(*tableName),
 			Item: map[string]types.AttributeValue{
 				"pk":        &types.AttributeValueMemberS{Value: pk},
 				"sk":        &types.AttributeValueMemberS{Value: sk},
-				"data":      &types.AttributeValueMemberS{Value: fmt.Sprintf("data_%d_%d", workerID, time.Now().UnixNano())},
+				"data":      &types.AttributeValueMemberS{Value: data},
 				"timestamp": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", time.Now().UnixNano())},
 			},
 		})
 		return err
 	})
+	latencyUs := time.Since(start).Microseconds()
 
 	if err != nil && !isShutdownError(err) {
-		atomic.AddInt64(&metrics.errors, 1)
+		metrics.RecordError(OpPutItem)
 	} else if err == nil {
-		atomic.AddInt64(&metrics.putItemOps, 1)
+		metrics.Record(OpPutItem, latencyUs)
 	}
 }
 
@@ -609,6 +833,7 @@ func performGetItem(ctx context.Context, client *dynamodb.Client, workerID int, 
 	pk := fmt.Sprintf("worker_%d", rng.Intn(*threads))
 	sk := fmt.Sprintf("item_%d", rng.Intn(1000))
 
+	start := time.Now()
 	err := withRetry(ctx, "GetItem", rng, func() error {
 		_, err := client.GetItem(ctx, &dynamodb.GetItemInput{
 			TableName: aws.String(*tableName),
@@ -619,11 +844,12 @@ func performGetItem(ctx context.Context, client *dynamodb.Client, workerID int, 
 		})
 		return err
 	})
+	latencyUs := time.Since(start).Microseconds()
 
 	if err != nil && !isShutdownError(err) {
-		atomic.AddInt64(&metrics.errors, 1)
+		metrics.RecordError(OpGetItem)
 	} else if err == nil {
-		atomic.AddInt64(&metrics.getItemOps, 1)
+		metrics.Record(OpGetItem, latencyUs)
 	}
 }
 
@@ -631,6 +857,7 @@ func performUpdateItem(ctx context.Context, client *dynamodb.Client, workerID in
 	pk := fmt.Sprintf("worker_%d", workerID)
 	sk := fmt.Sprintf("item_%d", rng.Intn(1000))
 
+	start := time.Now()
 	err := withRetry(ctx, "UpdateItem", rng, func() error {
 		_, err := client.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName: aws.String(*tableName),
@@ -638,23 +865,24 @@ func performUpdateItem(ctx context.Context, client *dynamodb.Client, workerID in
 				"pk": &types.AttributeValueMemberS{Value: pk},
 				"sk": &types.AttributeValueMemberS{Value: sk},
 			},
-			UpdateExpression: aws.String("SET #d = :data, #ts = :timestamp"),
+			UpdateExpression: aws.String("SET #data = :data, #ts = :timestamp"),
 			ExpressionAttributeNames: map[string]string{
-				"#d":  "data",
-				"#ts": "timestamp",
+				"#data": "data",
+				"#ts":   "timestamp",
 			},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":data":      &types.AttributeValueMemberS{Value: fmt.Sprintf("updated_%d", time.Now().UnixNano())},
+				":data":      &types.AttributeValueMemberS{Value: fmt.Sprintf("updated_%d_%d", workerID, time.Now().UnixNano())},
 				":timestamp": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", time.Now().UnixNano())},
 			},
 		})
 		return err
 	})
+	latencyUs := time.Since(start).Microseconds()
 
 	if err != nil && !isShutdownError(err) {
-		atomic.AddInt64(&metrics.errors, 1)
+		metrics.RecordError(OpUpdateItem)
 	} else if err == nil {
-		atomic.AddInt64(&metrics.updateItemOps, 1)
+		metrics.Record(OpUpdateItem, latencyUs)
 	}
 }
 
@@ -663,12 +891,12 @@ func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerI
 	batchSize := 5 + rng.Intn(21)
 	pk := fmt.Sprintf("batch_worker_%d", workerID)
 
-	// Use a map to ensure unique sort keys
+	// Use a map to track used SKs and ensure uniqueness
 	usedSKs := make(map[string]bool)
 	writeRequests := make([]types.WriteRequest, 0, batchSize)
 
 	for len(writeRequests) < batchSize {
-		// Use timestamp + counter to guarantee uniqueness
+		// Generate unique SK using timestamp + counter
 		sk := fmt.Sprintf("batch_item_%d_%d_%d", workerID, time.Now().UnixNano(), len(writeRequests))
 		if usedSKs[sk] {
 			continue
@@ -680,13 +908,14 @@ func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerI
 				Item: map[string]types.AttributeValue{
 					"pk":        &types.AttributeValueMemberS{Value: pk},
 					"sk":        &types.AttributeValueMemberS{Value: sk},
-					"data":      &types.AttributeValueMemberS{Value: fmt.Sprintf("batch_data_%d", time.Now().UnixNano())},
+					"data":      &types.AttributeValueMemberS{Value: fmt.Sprintf("batch_data_%d", rng.Int())},
 					"timestamp": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", time.Now().UnixNano())},
 				},
 			},
 		})
 	}
 
+	start := time.Now()
 	err := withRetry(ctx, "BatchWriteItem", rng, func() error {
 		_, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
 			RequestItems: map[string][]types.WriteRequest{
@@ -695,11 +924,12 @@ func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerI
 		})
 		return err
 	})
+	latencyUs := time.Since(start).Microseconds()
 
 	if err != nil && !isShutdownError(err) {
-		atomic.AddInt64(&metrics.errors, 1)
+		metrics.RecordError(OpBatchWriteItem)
 	} else if err == nil {
-		atomic.AddInt64(&metrics.batchWriteItemOps, 1)
+		metrics.Record(OpBatchWriteItem, latencyUs)
 	}
 }
 
@@ -727,6 +957,7 @@ func performBatchGetItem(ctx context.Context, client *dynamodb.Client, workerID 
 		})
 	}
 
+	start := time.Now()
 	err := withRetry(ctx, "BatchGetItem", rng, func() error {
 		_, err := client.BatchGetItem(ctx, &dynamodb.BatchGetItemInput{
 			RequestItems: map[string]types.KeysAndAttributes{
@@ -737,26 +968,29 @@ func performBatchGetItem(ctx context.Context, client *dynamodb.Client, workerID 
 		})
 		return err
 	})
+	latencyUs := time.Since(start).Microseconds()
 
 	if err != nil && !isShutdownError(err) {
-		atomic.AddInt64(&metrics.errors, 1)
+		metrics.RecordError(OpBatchGetItem)
 	} else if err == nil {
-		atomic.AddInt64(&metrics.batchGetItemOps, 1)
+		metrics.Record(OpBatchGetItem, latencyUs)
 	}
 }
 
 func performListTables(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
+	start := time.Now()
 	err := withRetry(ctx, "ListTables", rng, func() error {
 		_, err := client.ListTables(ctx, &dynamodb.ListTablesInput{
 			Limit: aws.Int32(10),
 		})
 		return err
 	})
+	latencyUs := time.Since(start).Microseconds()
 
 	if err != nil && !isShutdownError(err) {
-		atomic.AddInt64(&metrics.errors, 1)
+		metrics.RecordError(OpListTables)
 	} else if err == nil {
-		atomic.AddInt64(&metrics.listTablesOps, 1)
+		metrics.Record(OpListTables, latencyUs)
 	}
 }
 
@@ -771,59 +1005,62 @@ func reportMetrics(stopChan <-chan struct{}) {
 		case <-stopChan:
 			return
 		case <-ticker.C:
-			elapsed := time.Since(startTime).Seconds()
-
-			getOps := atomic.LoadInt64(&metrics.getItemOps)
-			putOps := atomic.LoadInt64(&metrics.putItemOps)
-			updateOps := atomic.LoadInt64(&metrics.updateItemOps)
-			batchGetOps := atomic.LoadInt64(&metrics.batchGetItemOps)
-			batchWriteOps := atomic.LoadInt64(&metrics.batchWriteItemOps)
-			listOps := atomic.LoadInt64(&metrics.listTablesOps)
-			errs := atomic.LoadInt64(&metrics.errors)
-			totalOps := getOps + putOps + updateOps + batchGetOps + batchWriteOps + listOps
-			
-			// Calculate average latency
-			totalLatencyUs := atomic.LoadInt64(&metrics.totalLatencyUs)
-			opCount := atomic.LoadInt64(&metrics.opCount)
-			avgLatencyMs := float64(0)
-			if opCount > 0 {
-				avgLatencyMs = float64(totalLatencyUs) / float64(opCount) / 1000.0
+			if atomic.LoadInt32(&warmupComplete) == 0 {
+				log.Printf("[WARMUP] Still warming up...")
+				continue
 			}
 
-			log.Printf("[METRICS] Elapsed: %.0fs | Ops: %d (%.1f/s) | AvgLatency: %.0fms | Get: %d | Put: %d | Update: %d | BatchGet: %d | BatchWrite: %d | List: %d | Err: %d",
-				elapsed, totalOps, float64(totalOps)/elapsed, avgLatencyMs,
-				getOps, putOps, updateOps, batchGetOps, batchWriteOps, listOps, errs)
+			elapsed := time.Since(startTime).Seconds()
+			totalOps := metrics.GetTotalOps()
+			totalErrs := metrics.GetTotalErrors()
+
+			// Get per-operation counts
+			var counts [OpCount]int64
+			for i := 0; i < OpCount; i++ {
+				counts[i] = atomic.LoadInt64(&metrics.trackers[i].count)
+			}
+
+			log.Printf("[METRICS] Elapsed: %.0fs | Ops: %d (%.1f/s) | Get: %d | Put: %d | Update: %d | BatchGet: %d | BatchWrite: %d | List: %d | Err: %d",
+				elapsed, totalOps, float64(totalOps)/elapsed,
+				counts[OpGetItem], counts[OpPutItem], counts[OpUpdateItem],
+				counts[OpBatchGetItem], counts[OpBatchWriteItem], counts[OpListTables], totalErrs)
 		}
 	}
 }
 
 func printFinalMetrics() {
-	getOps := atomic.LoadInt64(&metrics.getItemOps)
-	putOps := atomic.LoadInt64(&metrics.putItemOps)
-	updateOps := atomic.LoadInt64(&metrics.updateItemOps)
-	batchGetOps := atomic.LoadInt64(&metrics.batchGetItemOps)
-	batchWriteOps := atomic.LoadInt64(&metrics.batchWriteItemOps)
-	listOps := atomic.LoadInt64(&metrics.listTablesOps)
-	errs := atomic.LoadInt64(&metrics.errors)
-	totalOps := getOps + putOps + updateOps + batchGetOps + batchWriteOps + listOps
-
 	fmt.Println("\n========== FINAL BENCHMARK RESULTS ==========")
 	fmt.Printf("Target:              %s\n", *target)
 	fmt.Printf("Threads:             %d\n", *threads)
 	fmt.Printf("Duration (seconds):  %d\n", *duration)
+	fmt.Printf("Warmup (seconds):    %d\n", *warmup)
+	fmt.Printf("Read Percentage:     %d%%\n", *readPct)
 	fmt.Printf("Table Name:          %s\n", *tableName)
 	fmt.Println("----------------------------------------------")
+
+	var totalOps, totalErrs int64
+	for i := 0; i < OpCount; i++ {
+		count, errs, p50, p95, p99, avg := metrics.trackers[i].GetStats()
+		totalOps += count
+		totalErrs += errs
+
+		if count > 0 {
+			fmt.Printf("\n%s:\n", opNames[i])
+			fmt.Printf("  Count:    %d\n", count)
+			fmt.Printf("  Errors:   %d\n", errs)
+			fmt.Printf("  Avg (ms): %.2f\n", avg)
+			fmt.Printf("  P50 (ms): %.2f\n", p50)
+			fmt.Printf("  P95 (ms): %.2f\n", p95)
+			fmt.Printf("  P99 (ms): %.2f\n", p99)
+		}
+	}
+
+	fmt.Println("\n----------------------------------------------")
 	fmt.Printf("Total Operations:    %d\n", totalOps)
 	fmt.Printf("Operations/Second:   %.2f\n", float64(totalOps)/float64(*duration))
-	fmt.Println("----------------------------------------------")
-	fmt.Printf("GetItem:             %d\n", getOps)
-	fmt.Printf("PutItem:             %d\n", putOps)
-	fmt.Printf("UpdateItem:          %d\n", updateOps)
-	fmt.Printf("BatchGetItem:        %d\n", batchGetOps)
-	fmt.Printf("BatchWriteItem:      %d\n", batchWriteOps)
-	fmt.Printf("ListTables:          %d\n", listOps)
-	fmt.Println("----------------------------------------------")
-	fmt.Printf("Total Errors:        %d\n", errs)
-	fmt.Printf("Error Rate:          %.2f%%\n", float64(errs)/float64(totalOps+errs)*100)
+	fmt.Printf("Total Errors:        %d\n", totalErrs)
+	if totalOps+totalErrs > 0 {
+		fmt.Printf("Error Rate:          %.2f%%\n", float64(totalErrs)/float64(totalOps+totalErrs)*100)
+	}
 	fmt.Println("==============================================")
 }
