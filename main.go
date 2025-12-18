@@ -16,32 +16,33 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
-	"github.com/scylladb/alternator-client-golang/helper"
+
+	// Import the alternator-client-golang sdkv2 subpackage
+	helper "github.com/scylladb/alternator-client-golang/sdkv2"
 )
 
 // Command-line flags
 var (
-	target             = flag.String("target", "ddb", "Target database: 'ddb' for DynamoDB or 'alternator' for ScyllaDB Alternator")
-	threads            = flag.Int("threads", 16, "Number of concurrent worker threads")
-	duration           = flag.Int("duration", 300, "Duration of the benchmark in seconds")
+	target              = flag.String("target", "ddb", "Target database: 'ddb' for DynamoDB or 'alternator' for ScyllaDB Alternator")
+	threads             = flag.Int("threads", 16, "Number of concurrent worker threads")
+	duration            = flag.Int("duration", 300, "Duration of the benchmark in seconds")
 	scyllaContactPoints = flag.String("scylla-contact-points", "", "Comma-separated list of ScyllaDB contact points (IP addresses or hostnames)")
-	scyllaPort         = flag.Int("scylla-port", 8000, "ScyllaDB Alternator port")
-	region             = flag.String("region", "us-east-1", "AWS region for DynamoDB")
-	tableName          = flag.String("table-name", "benchmark_table", "Name of the table to use for benchmarking")
+	scyllaPort          = flag.Int("scylla-port", 8000, "ScyllaDB Alternator port")
+	region              = flag.String("region", "us-east-1", "AWS region for DynamoDB")
+	tableName           = flag.String("table-name", "benchmark_table", "Name of the table to use for benchmarking")
 )
 
 // Metrics counters
 type Metrics struct {
-	getItemOps       int64
-	putItemOps       int64
-	updateItemOps    int64
-	batchGetItemOps  int64
+	getItemOps        int64
+	putItemOps        int64
+	updateItemOps     int64
+	batchGetItemOps   int64
 	batchWriteItemOps int64
-	listTablesOps    int64
-	errors           int64
+	listTablesOps     int64
+	errors            int64
 }
 
 // Global metrics
@@ -102,7 +103,8 @@ func main() {
 	case <-time.After(time.Duration(*duration) * time.Second):
 		log.Println("Benchmark duration completed")
 	case sig := <-sigChan:
-		log.Printf("Received signal %v, shutting down...", sig)
+		log.Printf("Received signal %v, shutting down immediately...", sig)
+		cancel() // Cancel context to stop all operations immediately
 	}
 
 	// Signal workers to stop
@@ -114,8 +116,10 @@ func main() {
 	// Print final metrics
 	printFinalMetrics()
 
-	// Cleanup - delete the table
-	if err := deleteBenchmarkTable(ctx, client); err != nil {
+	// Cleanup - delete the table (use background context since main context may be cancelled)
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cleanupCancel()
+	if err := deleteBenchmarkTable(cleanupCtx, client); err != nil {
 		log.Printf("Warning: Failed to delete benchmark table: %v", err)
 	}
 
@@ -173,38 +177,37 @@ func createAlternatorClient(ctx context.Context) (*dynamodb.Client, error) {
 		contactPoints[i] = strings.TrimSpace(cp)
 	}
 
-	// Use the ScyllaDB alternator-client-golang helper with special options
-	// This library provides load balancing and optimized headers for Alternator
+	// Use the ScyllaDB alternator-client-golang sdkv2 library v1.0.5
+	// Based on the library's README:
+	// https://github.com/scylladb/alternator-client-golang
 	//
-	// The helper.NewHelper function creates a client helper that:
-	// - Balances requests across multiple ScyllaDB nodes
-	// - Optimizes HTTP headers for better Alternator performance
-	// - Handles TLS certificate validation
+	// Available options:
+	// - helper.WithPort(port) - Set the Alternator port
+	// - helper.WithCredentials(accessKey, secretKey) - Set credentials
+	// - helper.WithOptimizeHeaders(true) - Optimize HTTP headers (reduces traffic up to 56%)
+	// - helper.WithIgnoreServerCertificateError(true) - Skip TLS cert validation
+	// - helper.WithScheme("http") - Use HTTP or "https" for HTTPS
+	// - helper.WithRack("rack") - Target specific rack
+	// - helper.WithDatacenter("dc") - Target specific datacenter
+	// - helper.WithHTTPClientTimeout(duration) - Set HTTP timeout
 	h, err := helper.NewHelper(
 		contactPoints,
-		helper.WithIgnoreServerCertificateError(true), // Skip TLS cert validation (useful for self-signed certs)
-		helper.WithOptimizeHeaders(true),              // Optimize HTTP headers for Alternator
-		helper.WithPort(*scyllaPort),                  // Set the Alternator port
-		helper.WithScheme("http"),                     // Use HTTP (change to "https" for TLS)
+		helper.WithPort(*scyllaPort),
+		helper.WithCredentials("alternator", "secret_pass"), // Ignored when auth is disabled
+		helper.WithOptimizeHeaders(true),                    // Optimize HTTP headers for Alternator
+		helper.WithIgnoreServerCertificateError(true),       // Skip TLS cert validation
+		helper.WithScheme("http"),                           // Use HTTP (change to "https" for TLS)
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create alternator helper: %w", err)
 	}
 
-	// Create the AWS config using the helper
-	// The helper provides the necessary components for the AWS SDK v2
-	cfg := aws.Config{
-		Region: "us-east-1", // Alternator ignores region but SDK requires it
-		Credentials: credentials.NewStaticCredentialsProvider(
-			"alternator",  // Access key (ignored when auth is disabled)
-			"secret_pass", // Secret key (ignored when auth is disabled)
-			"",            // Session token
-		),
-		EndpointResolverWithOptions: h.EndpointResolver(),
-		HTTPClient:                  h.HTTPClient(),
+	// Create the DynamoDB client from the helper
+	client, err := h.NewDynamoDB()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamodb client from helper: %w", err)
 	}
 
-	client := dynamodb.NewFromConfig(cfg)
 	return client, nil
 }
 
@@ -255,7 +258,6 @@ func createBenchmarkTable(ctx context.Context, client *dynamodb.Client) error {
 		createInput.BillingMode = types.BillingModePayPerRequest
 	} else {
 		// ScyllaDB Alternator: use provisioned throughput (supported in Scylla 2025.3.4)
-		// Note: Scylla Alternator doesn't fully support on-demand, so we use provisioned
 		createInput.BillingMode = types.BillingModeProvisioned
 		createInput.ProvisionedThroughput = &types.ProvisionedThroughput{
 			ReadCapacityUnits:  aws.Int64(100),
@@ -309,30 +311,45 @@ func runWorker(ctx context.Context, client *dynamodb.Client, workerID int, stopC
 	log.Printf("Worker %d started", workerID)
 
 	for {
+		// Check for shutdown signals first
 		select {
 		case <-stopChan:
-			log.Printf("Worker %d stopping", workerID)
+			log.Printf("Worker %d stopping (stopChan)", workerID)
 			return
 		case <-ctx.Done():
-			log.Printf("Worker %d context cancelled", workerID)
+			log.Printf("Worker %d stopping (context cancelled)", workerID)
 			return
 		default:
-			// Randomly select an operation to perform
-			operation := rand.Intn(6)
-			switch operation {
-			case 0:
-				performPutItem(ctx, client, workerID)
-			case 1:
-				performGetItem(ctx, client, workerID)
-			case 2:
-				performUpdateItem(ctx, client, workerID)
-			case 3:
-				performBatchWriteItem(ctx, client, workerID)
-			case 4:
-				performBatchGetItem(ctx, client, workerID)
-			case 5:
-				performListTables(ctx, client, workerID)
-			}
+			// Continue with work
+		}
+
+		// Randomly select an operation to perform
+		operation := rand.Intn(6)
+		switch operation {
+		case 0:
+			performPutItem(ctx, client, workerID)
+		case 1:
+			performGetItem(ctx, client, workerID)
+		case 2:
+			performUpdateItem(ctx, client, workerID)
+		case 3:
+			performBatchWriteItem(ctx, client, workerID)
+		case 4:
+			performBatchGetItem(ctx, client, workerID)
+		case 5:
+			performListTables(ctx, client, workerID)
+		}
+
+		// Check again after operation completes
+		select {
+		case <-stopChan:
+			log.Printf("Worker %d stopping (stopChan)", workerID)
+			return
+		case <-ctx.Done():
+			log.Printf("Worker %d stopping (context cancelled)", workerID)
+			return
+		default:
+			// Continue to next operation
 		}
 	}
 }
@@ -340,12 +357,31 @@ func runWorker(ctx context.Context, client *dynamodb.Client, workerID int, stopC
 func withRetry(ctx context.Context, operationName string, operation func() error) error {
 	var lastErr error
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Check if context is cancelled before attempting
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		err := operation()
 		if err == nil {
 			return nil
 		}
 
+		// Check if context is cancelled - don't retry if shutting down
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		lastErr = err
+
+		// Don't log or retry on last attempt
+		if attempt == maxRetries-1 {
+			break
+		}
 
 		// Calculate exponential backoff
 		backoffMs := initialBackoffMs * (1 << attempt) // 1s, 2s, 4s, 8s, 16s
@@ -447,10 +483,19 @@ func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerI
 	batchSize := 5 + rand.Intn(21)
 	pk := fmt.Sprintf("batch_worker_%d", workerID)
 
-	writeRequests := make([]types.WriteRequest, batchSize)
-	for i := 0; i < batchSize; i++ {
-		sk := fmt.Sprintf("batch_item_%d_%d", workerID, rand.Intn(10000))
-		writeRequests[i] = types.WriteRequest{
+	// Use a map to ensure unique sort keys
+	usedSKs := make(map[string]bool)
+	writeRequests := make([]types.WriteRequest, 0, batchSize)
+
+	for len(writeRequests) < batchSize {
+		// Use timestamp + counter to guarantee uniqueness
+		sk := fmt.Sprintf("batch_item_%d_%d_%d", workerID, time.Now().UnixNano(), len(writeRequests))
+		if usedSKs[sk] {
+			continue
+		}
+		usedSKs[sk] = true
+
+		writeRequests = append(writeRequests, types.WriteRequest{
 			PutRequest: &types.PutRequest{
 				Item: map[string]types.AttributeValue{
 					"pk":        &types.AttributeValueMemberS{Value: pk},
@@ -459,7 +504,7 @@ func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerI
 					"timestamp": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", time.Now().UnixNano())},
 				},
 			},
-		}
+		})
 	}
 
 	err := withRetry(ctx, "BatchWriteItem", func() error {
@@ -481,15 +526,25 @@ func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerI
 func performBatchGetItem(ctx context.Context, client *dynamodb.Client, workerID int) {
 	// Batch size between 5 and 100 items
 	batchSize := 5 + rand.Intn(96)
-	
-	keys := make([]map[string]types.AttributeValue, batchSize)
-	for i := 0; i < batchSize; i++ {
+
+	// Use a map to ensure unique key combinations
+	usedKeys := make(map[string]bool)
+	keys := make([]map[string]types.AttributeValue, 0, batchSize)
+
+	for len(keys) < batchSize {
 		pk := fmt.Sprintf("worker_%d", rand.Intn(*threads))
 		sk := fmt.Sprintf("item_%d", rand.Intn(1000))
-		keys[i] = map[string]types.AttributeValue{
+		keyStr := pk + "|" + sk
+
+		if usedKeys[keyStr] {
+			continue
+		}
+		usedKeys[keyStr] = true
+
+		keys = append(keys, map[string]types.AttributeValue{
 			"pk": &types.AttributeValueMemberS{Value: pk},
 			"sk": &types.AttributeValueMemberS{Value: sk},
-		}
+		})
 	}
 
 	err := withRetry(ctx, "BatchGetItem", func() error {
@@ -537,7 +592,7 @@ func reportMetrics(stopChan <-chan struct{}) {
 			return
 		case <-ticker.C:
 			elapsed := time.Since(startTime).Seconds()
-			
+
 			getOps := atomic.LoadInt64(&metrics.getItemOps)
 			putOps := atomic.LoadInt64(&metrics.putItemOps)
 			updateOps := atomic.LoadInt64(&metrics.updateItemOps)

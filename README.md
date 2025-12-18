@@ -13,31 +13,16 @@ A Go-based benchmarking tool for comparing performance between AWS DynamoDB and 
 - Graceful shutdown on SIGINT/SIGTERM
 - Automatic table creation and cleanup
 
-## ScyllaDB Library Options
+## ScyllaDB Alternator Client Library
 
-This benchmark provides **two implementations** for connecting to ScyllaDB Alternator:
-
-### Option 1: alternator-client-golang (Default - main.go)
-Uses `github.com/scylladb/alternator-client-golang` v1.0.5 with the `helper` package:
-- `helper.WithIgnoreServerCertificateError(true)` - Skip TLS cert validation
-- `helper.WithOptimizeHeaders(true)` - Optimize HTTP headers for Alternator
+This benchmark uses `github.com/scylladb/alternator-client-golang/sdkv2` v1.0.5 (the AWS SDK v2 subpackage) with the following options:
 - `helper.WithPort(port)` - Set the Alternator port
-- `helper.WithScheme("http")` - Use HTTP or HTTPS
+- `helper.WithCredentials(accessKey, secretKey)` - Set credentials (ignored when auth is disabled)
+- `helper.WithOptimizeHeaders(true)` - Optimize HTTP headers (reduces traffic up to 56%)
+- `helper.WithIgnoreServerCertificateError(true)` - Skip TLS cert validation
+- `helper.WithScheme("http")` - Use HTTP or "https" for TLS
 
-### Option 2: alternator-load-balancing (Alternative - main_alternative.go)
-Uses `github.com/scylladb/alternator-load-balancing/go/v2`:
-- Well-documented library with stable API
-- Built-in node discovery via `/localnodes`
-- Simple configuration
-
-To use the alternative implementation:
-```bash
-# Rename files
-mv main.go main_acg.go
-mv main_alternative.go main.go
-
-# Update go.mod to use alternator-load-balancing instead
-```
+The library provides automatic load balancing across all Alternator nodes.
 
 ## Prerequisites
 
@@ -66,25 +51,45 @@ Download and run the installer from [https://go.dev/dl/](https://go.dev/dl/)
 ### 2. Clone or download this project
 
 ```bash
-# If using git
-git clone <repository-url>
-cd ddb-benchmark
-
-# Or simply navigate to the directory containing the source files
 cd ddb-benchmark
 ```
 
 ### 3. Download dependencies
 
 ```bash
-# This downloads all required Go modules
+# This downloads all required Go modules and generates go.sum
 go mod tidy
 ```
 
 This command will download:
 - AWS SDK v2 for Go
-- ScyllaDB alternator-client-golang v1.0.5 (or alternator-load-balancing for alternative)
+- ScyllaDB alternator-client-golang/sdkv2 v1.0.5
 - All transitive dependencies
+
+## Troubleshooting go.sum / Module Issues
+
+If you see errors about missing `go.sum` entries after running `go mod tidy`:
+
+```bash
+# Method 1: Run go mod download first
+go mod download
+go mod tidy
+
+# Method 2: Clean the module cache and retry
+go clean -modcache
+go mod tidy
+
+# Method 3: If specific packages are missing, download them explicitly
+go get github.com/aws/aws-sdk-go-v2@v1.30.3
+go get github.com/aws/aws-sdk-go-v2/config@v1.27.27
+go get github.com/aws/aws-sdk-go-v2/credentials@v1.17.27
+go get github.com/aws/aws-sdk-go-v2/service/dynamodb@v1.34.4
+go get github.com/scylladb/alternator-client-golang/sdkv2@v1.0.5
+```
+
+**Note:** The alternator-client-golang library has separate subpackages for AWS SDK v1 and v2:
+- `github.com/scylladb/alternator-client-golang/sdkv1` - for AWS SDK v1
+- `github.com/scylladb/alternator-client-golang/sdkv2` - for AWS SDK v2 (used in this benchmark)
 
 ## Usage
 
@@ -222,31 +227,6 @@ The benchmark creates a table with the following schema:
 - **DynamoDB**: Uses on-demand (PAY_PER_REQUEST) billing mode
 - **ScyllaDB Alternator**: Uses provisioned throughput (100 RCU/WCU)
 
-## Troubleshooting
-
-### AWS Credentials Not Found
-```bash
-# Set environment variables
-export AWS_ACCESS_KEY_ID=your-access-key
-export AWS_SECRET_ACCESS_KEY=your-secret-key
-export AWS_REGION=us-east-1
-
-# Or configure AWS CLI
-aws configure
-```
-
-### ScyllaDB Connection Refused
-1. Ensure Alternator is enabled in ScyllaDB configuration
-2. Check the port is correct (default: 8000)
-3. Verify network connectivity to ScyllaDB nodes
-
-### Go Module Errors
-```bash
-# Clear module cache and re-download
-go clean -modcache
-go mod tidy
-```
-
 ## ScyllaDB Alternator Setup
 
 To enable Alternator on ScyllaDB 2025.3.4:
@@ -267,7 +247,3 @@ sudo systemctl restart scylla-server
 ## License
 
 MIT License - feel free to use and modify for your benchmarking needs.
-
-## Contributing
-
-Contributions are welcome! Please submit issues and pull requests.
