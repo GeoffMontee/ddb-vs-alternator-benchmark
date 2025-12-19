@@ -127,6 +127,13 @@ go get github.com/scylladb/alternator-client-golang/sdkv2@v1.0.5
 | `--seed-items` | Number of items to seed before benchmark (0 = no seeding) | `0` |
 | `--seed-batch-size` | Number of items per BatchWriteItem during seeding (max 25) | `25` |
 
+#### Key Partitioning (for parallel loaders)
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--loader-id` | Loader ID for key partitioning (0 = no prefix). Use different IDs for parallel loaders. | `0` |
+| `--key-range` | Number of unique sort keys per partition key | `1000` |
+
 #### Operation Mix
 
 | Parameter | Description | Default |
@@ -202,6 +209,38 @@ go run main.go --target alternator \
     --threads 32 \
     --duration 60
 ```
+
+### Running Parallel Loaders
+
+Use `--loader-id` to run multiple loader instances with non-overlapping keys:
+
+```bash
+# Terminal 1: Loader 1
+go run main.go --target alternator \
+    --scylla-contact-points "192.168.1.100" \
+    --loader-id 1 \
+    --seed-items 100000 \
+    --threads 32 \
+    --duration 60
+
+# Terminal 2: Loader 2
+go run main.go --target alternator \
+    --scylla-contact-points "192.168.1.100" \
+    --loader-id 2 \
+    --seed-items 100000 \
+    --threads 32 \
+    --duration 60
+
+# Terminal 3: Loader 3
+go run main.go --target alternator \
+    --scylla-contact-points "192.168.1.100" \
+    --loader-id 3 \
+    --seed-items 100000 \
+    --threads 32 \
+    --duration 60
+```
+
+Each loader will use keys prefixed with `L1_`, `L2_`, `L3_`, etc., ensuring no key collisions.
 
 ### Building a Binary
 

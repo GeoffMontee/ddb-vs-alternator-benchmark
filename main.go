@@ -105,6 +105,10 @@ var (
 	seedItems     = flag.Int("seed-items", 0, "Number of items to seed before benchmark (0 = no seeding)")
 	seedBatchSize = flag.Int("seed-batch-size", 25, "Number of items per BatchWriteItem during seeding (max 25)")
 
+	// Key partitioning flags
+	loaderID = flag.Int("loader-id", 0, "Loader ID for key partitioning (0 = no prefix). Use different IDs for parallel loaders.")
+	keyRange = flag.Int("key-range", 1000, "Number of unique sort keys per partition key (affects read/write distribution)")
+
 	// Operation mix flags
 	readPct = flag.Int("read-pct", 50, "Percentage of read operations (0-100). Reads = GetItem + BatchGetItem. Writes = PutItem + UpdateItem + BatchWriteItem. ListTables is separate.")
 )
@@ -236,6 +240,19 @@ const (
 	initialBackoffMs = 1000 // 1 second initial backoff
 )
 
+// pkPrefix returns the partition key prefix based on loader-id
+func pkPrefix() string {
+	if *loaderID > 0 {
+		return fmt.Sprintf("L%d_", *loaderID)
+	}
+	return ""
+}
+
+// makePK generates a partition key with optional loader prefix
+func makePK(base string) string {
+	return pkPrefix() + base
+}
+
 func main() {
 	flag.Parse()
 
@@ -297,6 +314,10 @@ func main() {
 func runBenchmark(ctx context.Context, client *dynamodb.Client, sigChan chan os.Signal, cancel context.CancelFunc) {
 	log.Printf("Starting benchmark against %s with %d threads for %d seconds (warmup: %ds)", *target, *threads, *duration, *warmup)
 	log.Printf("Table name: %s", *tableName)
+	if *loaderID > 0 {
+		log.Printf("Loader ID: %d (key prefix: %s)", *loaderID, pkPrefix())
+	}
+	log.Printf("Key range: %d unique sort keys per partition", *keyRange)
 	log.Printf("Read percentage: %d%% (reads=GetItem+BatchGetItem, writes=PutItem+UpdateItem+BatchWriteItem)", *readPct)
 
 	// Start workers
@@ -353,7 +374,11 @@ func runBenchmark(ctx context.Context, client *dynamodb.Client, sigChan chan os.
 }
 
 func seedData(ctx context.Context, client *dynamodb.Client) error {
-	log.Printf("Seeding %d items with batch size %d...", *seedItems, *seedBatchSize)
+	if *loaderID > 0 {
+		log.Printf("Seeding %d items with batch size %d (loader-id: %d, key prefix: %s)...", *seedItems, *seedBatchSize, *loaderID, pkPrefix())
+	} else {
+		log.Printf("Seeding %d items with batch size %d...", *seedItems, *seedBatchSize)
+	}
 
 	batchSize := *seedBatchSize
 	if batchSize > 25 {
@@ -381,8 +406,8 @@ func seedData(ctx context.Context, client *dynamodb.Client) error {
 		writeRequests := make([]types.WriteRequest, 0, itemsInBatch)
 		for i := 0; i < itemsInBatch; i++ {
 			itemNum := itemsWritten + i
-			pk := fmt.Sprintf("worker_%d", itemNum%(*threads))
-			sk := fmt.Sprintf("item_%d", itemNum)
+			pk := makePK(fmt.Sprintf("worker_%d", itemNum%(*threads)))
+			sk := fmt.Sprintf("item_%d", itemNum%(*keyRange))
 
 			writeRequests = append(writeRequests, types.WriteRequest{
 				PutRequest: &types.PutRequest{
@@ -803,8 +828,8 @@ func isShutdownError(err error) bool {
 }
 
 func performPutItem(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
-	pk := fmt.Sprintf("worker_%d", workerID)
-	sk := fmt.Sprintf("item_%d", rng.Intn(1000))
+	pk := makePK(fmt.Sprintf("worker_%d", workerID))
+	sk := fmt.Sprintf("item_%d", rng.Intn(*keyRange))
 	data := fmt.Sprintf("data_%d_%d", workerID, time.Now().UnixNano())
 
 	start := time.Now()
@@ -830,8 +855,8 @@ func performPutItem(ctx context.Context, client *dynamodb.Client, workerID int, 
 }
 
 func performGetItem(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
-	pk := fmt.Sprintf("worker_%d", rng.Intn(*threads))
-	sk := fmt.Sprintf("item_%d", rng.Intn(1000))
+	pk := makePK(fmt.Sprintf("worker_%d", rng.Intn(*threads)))
+	sk := fmt.Sprintf("item_%d", rng.Intn(*keyRange))
 
 	start := time.Now()
 	err := withRetry(ctx, "GetItem", rng, func() error {
@@ -854,8 +879,8 @@ func performGetItem(ctx context.Context, client *dynamodb.Client, workerID int, 
 }
 
 func performUpdateItem(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
-	pk := fmt.Sprintf("worker_%d", workerID)
-	sk := fmt.Sprintf("item_%d", rng.Intn(1000))
+	pk := makePK(fmt.Sprintf("worker_%d", workerID))
+	sk := fmt.Sprintf("item_%d", rng.Intn(*keyRange))
 
 	start := time.Now()
 	err := withRetry(ctx, "UpdateItem", rng, func() error {
@@ -889,7 +914,7 @@ func performUpdateItem(ctx context.Context, client *dynamodb.Client, workerID in
 func performBatchWriteItem(ctx context.Context, client *dynamodb.Client, workerID int, rng *rand.Rand) {
 	// Batch size between 5 and 25 items
 	batchSize := 5 + rng.Intn(21)
-	pk := fmt.Sprintf("batch_worker_%d", workerID)
+	pk := makePK(fmt.Sprintf("batch_worker_%d", workerID))
 
 	// Use a map to track used SKs and ensure uniqueness
 	usedSKs := make(map[string]bool)
@@ -942,8 +967,8 @@ func performBatchGetItem(ctx context.Context, client *dynamodb.Client, workerID 
 	keys := make([]map[string]types.AttributeValue, 0, batchSize)
 
 	for len(keys) < batchSize {
-		pk := fmt.Sprintf("worker_%d", rng.Intn(*threads))
-		sk := fmt.Sprintf("item_%d", rng.Intn(1000))
+		pk := makePK(fmt.Sprintf("worker_%d", rng.Intn(*threads)))
+		sk := fmt.Sprintf("item_%d", rng.Intn(*keyRange))
 		keyStr := pk + "|" + sk
 
 		if usedKeys[keyStr] {
@@ -1035,6 +1060,10 @@ func printFinalMetrics() {
 	fmt.Printf("Duration (seconds):  %d\n", *duration)
 	fmt.Printf("Warmup (seconds):    %d\n", *warmup)
 	fmt.Printf("Read Percentage:     %d%%\n", *readPct)
+	fmt.Printf("Key Range:           %d\n", *keyRange)
+	if *loaderID > 0 {
+		fmt.Printf("Loader ID:           %d (prefix: %s)\n", *loaderID, pkPrefix())
+	}
 	fmt.Printf("Table Name:          %s\n", *tableName)
 	fmt.Println("----------------------------------------------")
 
