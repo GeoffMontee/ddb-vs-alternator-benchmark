@@ -126,8 +126,9 @@ go get github.com/scylladb/alternator-client-golang/sdkv2@v1.0.5
 |-----------|-------------|---------|
 | `--seed-items` | Number of items to seed before benchmark (0 = no seeding) | `0` |
 | `--seed-batch-size` | Number of items per seeding batch (max 1000) | `1000` |
+| `--seed-partitions` | Number of partition keys to spread seeded items across (0 = `--threads`) | `0` |
 
-Seeding uses `--threads` concurrent workers. Each seeding batch is split into DynamoDB-compatible `BatchWriteItem` chunks of 25 items.
+Seeding uses `--threads` concurrent workers issuing DynamoDB-compatible `BatchWriteItem` chunks of 25 items. `UnprocessedItems` are retried with backoff. Increasing `--seed-partitions` can improve seed write distribution, but values above `--threads` may reduce read hits during the benchmark unless your read workload targets the same wider keyspace.
 
 #### Key Partitioning (for parallel loaders)
 
@@ -189,6 +190,7 @@ go run main.go --target alternator \
     --scylla-contact-points "192.168.1.100" \
     --seed-items 10000 \
     --seed-batch-size 1000 \
+    --seed-partitions 1000 \
     --threads 32 \
     --duration 60
 

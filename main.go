@@ -102,8 +102,9 @@ var (
 	performBenchmark = flag.Bool("perform-benchmark", true, "Perform the benchmark")
 
 	// Data seeding flags
-	seedItems     = flag.Int("seed-items", 0, "Number of items to seed before benchmark (0 = no seeding)")
-	seedBatchSize = flag.Int("seed-batch-size", 1000, "Number of items per seeding batch (max 1000)")
+	seedItems      = flag.Int("seed-items", 0, "Number of items to seed before benchmark (0 = no seeding)")
+	seedBatchSize  = flag.Int("seed-batch-size", 1000, "Number of items per seeding batch (max 1000)")
+	seedPartitions = flag.Int("seed-partitions", 0, "Number of partition keys to spread seeded items across (0 = --threads)")
 
 	// Key partitioning flags
 	loaderID = flag.Int("loader-id", 0, "Loader ID for key partitioning (0 = no prefix). Use different IDs for parallel loaders.")
@@ -246,6 +247,12 @@ const (
 	maxBatchWriteItems = 25 // DynamoDB BatchWriteItem limit
 )
 
+type seedChunk struct {
+	batch    int
+	start    int
+	requests []types.WriteRequest
+}
+
 // pkPrefix returns the partition key prefix based on loader-id
 func pkPrefix() string {
 	if *loaderID > 0 {
@@ -257,6 +264,13 @@ func pkPrefix() string {
 // makePK generates a partition key with optional loader prefix
 func makePK(base string) string {
 	return pkPrefix() + base
+}
+
+func seedPartitionCount() int {
+	if *seedPartitions > 0 {
+		return *seedPartitions
+	}
+	return *threads
 }
 
 func main() {
@@ -379,90 +393,89 @@ func runBenchmark(ctx context.Context, client *dynamodb.Client) {
 
 func seedData(ctx context.Context, client *dynamodb.Client) error {
 	batchSize := *seedBatchSize
-
 	totalBatches := (*seedItems + batchSize - 1) / batchSize
+	totalChunks := (*seedItems + maxBatchWriteItems - 1) / maxBatchWriteItems
 	seedThreads := *threads
+	partitionCount := seedPartitionCount()
 	if *loaderID > 0 {
-		log.Printf("Seeding %d items with batch size %d across %d threads (loader-id: %d, key prefix: %s, BatchWriteItem chunks: %d)...", *seedItems, batchSize, seedThreads, *loaderID, pkPrefix(), maxBatchWriteItems)
+		log.Printf("Seeding %d items with batch size %d across %d threads (loader-id: %d, key prefix: %s, partitions: %d, BatchWriteItem chunks: %d)...", *seedItems, batchSize, seedThreads, *loaderID, pkPrefix(), partitionCount, maxBatchWriteItems)
 	} else {
-		log.Printf("Seeding %d items with batch size %d across %d threads (BatchWriteItem chunks: %d)...", *seedItems, batchSize, seedThreads, maxBatchWriteItems)
+		log.Printf("Seeding %d items with batch size %d across %d threads (partitions: %d, BatchWriteItem chunks: %d)...", *seedItems, batchSize, seedThreads, partitionCount, maxBatchWriteItems)
 	}
 
 	var itemsWritten int64
-	var batchesCompleted int64
+	var chunksCompleted int64
 
 	startTime := time.Now()
-	progressEvery := int64((totalBatches / 10) + 1)
+	progressEvery := int64((totalChunks / 10) + 1)
 
 	seedCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	var wg sync.WaitGroup
 	errCh := make(chan error, seedThreads)
+	chunkCh := make(chan seedChunk, seedThreads*2)
+
+	go func() {
+		defer close(chunkCh)
+
+		for batch := 0; batch < totalBatches; batch++ {
+			startItem := batch * batchSize
+			itemsInBatch := batchSize
+			remaining := *seedItems - startItem
+			if remaining < itemsInBatch {
+				itemsInBatch = remaining
+			}
+
+			for chunkStart := 0; chunkStart < itemsInBatch; chunkStart += maxBatchWriteItems {
+				chunkItemCount := maxBatchWriteItems
+				if chunkStart+chunkItemCount > itemsInBatch {
+					chunkItemCount = itemsInBatch - chunkStart
+				}
+
+				start := startItem + chunkStart
+				chunk := seedChunk{
+					batch:    batch,
+					start:    start,
+					requests: buildSeedWriteRequests(start, chunkItemCount, partitionCount),
+				}
+
+				select {
+				case <-seedCtx.Done():
+					return
+				case chunkCh <- chunk:
+				}
+			}
+		}
+	}()
 
 	for workerID := 0; workerID < seedThreads; workerID++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
+			rng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(workerID)))
 
-			for batch := workerID; batch < totalBatches; batch += seedThreads {
+			for chunk := range chunkCh {
 				select {
 				case <-seedCtx.Done():
 					return
 				default:
 				}
 
-				startItem := batch * batchSize
-				itemsInBatch := batchSize
-				remaining := *seedItems - startItem
-				if remaining < itemsInBatch {
-					itemsInBatch = remaining
-				}
-
-				writeRequests := make([]types.WriteRequest, 0, itemsInBatch)
-				for i := 0; i < itemsInBatch; i++ {
-					itemNum := startItem + i
-					pk := makePK(fmt.Sprintf("worker_%d", itemNum%(*threads)))
-					sk := fmt.Sprintf("item_%d", itemNum%(*keyRange))
-
-					writeRequests = append(writeRequests, types.WriteRequest{
-						PutRequest: &types.PutRequest{
-							Item: map[string]types.AttributeValue{
-								"pk":        &types.AttributeValueMemberS{Value: pk},
-								"sk":        &types.AttributeValueMemberS{Value: sk},
-								"data":      &types.AttributeValueMemberS{Value: fmt.Sprintf("seed_data_%d", itemNum)},
-								"timestamp": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", time.Now().UnixNano())},
-							},
-						},
-					})
-				}
-
-				for chunkStart := 0; chunkStart < len(writeRequests); chunkStart += maxBatchWriteItems {
-					chunkEnd := chunkStart + maxBatchWriteItems
-					if chunkEnd > len(writeRequests) {
-						chunkEnd = len(writeRequests)
+				if err := writeSeedChunk(seedCtx, client, rng, chunk.requests); err != nil {
+					select {
+					case errCh <- fmt.Errorf("failed to seed batch %d items %d-%d: %w", chunk.batch, chunk.start, chunk.start+len(chunk.requests)-1, err):
+					default:
 					}
-
-					_, err := client.BatchWriteItem(seedCtx, &dynamodb.BatchWriteItemInput{
-						RequestItems: map[string][]types.WriteRequest{
-							*tableName: writeRequests[chunkStart:chunkEnd],
-						},
-					})
-					if err != nil {
-						select {
-						case errCh <- fmt.Errorf("failed to seed batch %d items %d-%d: %w", batch, chunkStart, chunkEnd-1, err):
-						default:
-						}
-						cancel()
-						return
-					}
+					cancel()
+					return
 				}
 
-				written := atomic.AddInt64(&itemsWritten, int64(itemsInBatch))
-				completed := atomic.AddInt64(&batchesCompleted, 1)
+				written := atomic.AddInt64(&itemsWritten, int64(len(chunk.requests)))
+				completed := atomic.AddInt64(&chunksCompleted, 1)
 
 				// Progress update every 10%
-				if completed%progressEvery == 0 || completed == int64(totalBatches) {
+				if completed%progressEvery == 0 || completed == int64(totalChunks) {
 					elapsed := time.Since(startTime).Seconds()
 					rate := float64(written) / elapsed
 					log.Printf("Seeding progress: %d/%d items (%.0f items/s)", written, *seedItems, rate)
@@ -484,6 +497,82 @@ func seedData(ctx context.Context, client *dynamodb.Client) error {
 	elapsed := time.Since(startTime).Seconds()
 	log.Printf("Seeding complete: %d items in %.1fs (%.0f items/s)", itemsWritten, elapsed, float64(itemsWritten)/elapsed)
 	return nil
+}
+
+func buildSeedWriteRequests(startItem, itemCount, partitionCount int) []types.WriteRequest {
+	writeRequests := make([]types.WriteRequest, 0, itemCount)
+	for i := 0; i < itemCount; i++ {
+		itemNum := startItem + i
+		pkNum := itemNum % partitionCount
+		skNum := (itemNum / partitionCount) % (*keyRange)
+		pk := makePK(fmt.Sprintf("worker_%d", pkNum))
+		sk := fmt.Sprintf("item_%d", skNum)
+
+		writeRequests = append(writeRequests, types.WriteRequest{
+			PutRequest: &types.PutRequest{
+				Item: map[string]types.AttributeValue{
+					"pk":        &types.AttributeValueMemberS{Value: pk},
+					"sk":        &types.AttributeValueMemberS{Value: sk},
+					"data":      &types.AttributeValueMemberS{Value: fmt.Sprintf("seed_data_%d", itemNum)},
+					"timestamp": &types.AttributeValueMemberN{Value: fmt.Sprintf("%d", time.Now().UnixNano())},
+				},
+			},
+		})
+	}
+	return writeRequests
+}
+
+func writeSeedChunk(ctx context.Context, client *dynamodb.Client, rng *rand.Rand, writeRequests []types.WriteRequest) error {
+	requestItems := map[string][]types.WriteRequest{
+		*tableName: writeRequests,
+	}
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		output, err := client.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{
+			RequestItems: requestItems,
+		})
+		if err == nil {
+			if output == nil {
+				return nil
+			}
+			unprocessed := countWriteRequests(output.UnprocessedItems)
+			if unprocessed == 0 {
+				return nil
+			}
+			requestItems = output.UnprocessedItems
+			err = fmt.Errorf("%d unprocessed items", unprocessed)
+		}
+
+		if attempt == maxRetries-1 {
+			return err
+		}
+
+		backoffMs := initialBackoffMs * (1 << attempt)
+		jitter := rng.Intn(backoffMs / 4)
+		sleepDuration := time.Duration(backoffMs+jitter) * time.Millisecond
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(sleepDuration):
+		}
+	}
+
+	return nil
+}
+
+func countWriteRequests(requestItems map[string][]types.WriteRequest) int {
+	count := 0
+	for _, requests := range requestItems {
+		count += len(requests)
+	}
+	return count
 }
 
 func validateFlags() error {
@@ -513,6 +602,10 @@ func validateFlags() error {
 
 	if *seedBatchSize < 1 || *seedBatchSize > maxSeedBatchSize {
 		return fmt.Errorf("seed-batch-size must be between 1 and %d", maxSeedBatchSize)
+	}
+
+	if *seedPartitions < 0 {
+		return fmt.Errorf("seed-partitions must be 0 or greater")
 	}
 
 	return nil
