@@ -102,7 +102,7 @@ go get github.com/scylladb/alternator-client-golang/sdkv2@v1.0.5
 | Parameter | Description | Default | Required |
 |-----------|-------------|---------|----------|
 | `--target` | Target database: `ddb` or `alternator` | `ddb` | No |
-| `--threads` | Number of concurrent worker threads | `16` | No |
+| `--threads` | Number of concurrent worker threads for benchmark and seeding | `16` | No |
 | `--duration` | Benchmark duration in seconds | `300` | No |
 | `--warmup` | Warmup period in seconds (metrics discarded) | `10` | No |
 | `--table-name` | Name of the benchmark table | `benchmark_table` | No |
@@ -125,7 +125,9 @@ go get github.com/scylladb/alternator-client-golang/sdkv2@v1.0.5
 | Parameter | Description | Default |
 |-----------|-------------|---------|
 | `--seed-items` | Number of items to seed before benchmark (0 = no seeding) | `0` |
-| `--seed-batch-size` | Number of items per BatchWriteItem during seeding (max 25) | `25` |
+| `--seed-batch-size` | Number of items per seeding batch (max 1000) | `1000` |
+
+Seeding uses `--threads` concurrent workers. Each seeding batch is split into DynamoDB-compatible `BatchWriteItem` chunks of 25 items.
 
 #### Key Partitioning (for parallel loaders)
 
@@ -186,7 +188,7 @@ go run main.go --target alternator \
 go run main.go --target alternator \
     --scylla-contact-points "192.168.1.100" \
     --seed-items 10000 \
-    --seed-batch-size 25 \
+    --seed-batch-size 1000 \
     --threads 32 \
     --duration 60
 
